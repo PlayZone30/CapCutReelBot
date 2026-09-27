@@ -1,0 +1,23 @@
+# Secrets
+.env
+*.json.key
+service_account*.json
+
+# Rate limiter state
+.gemini_rate_state.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Working data
+raw/
+processed/
+*.mp4
+*.mov
+*.log
+
+# OS
+.DS_Store

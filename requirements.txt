@@ -1,0 +1,13 @@
+# Core
+python-dotenv==1.0.1
+
+# Gemini API (Google Gen AI SDK, Interactions API)
+# NOTE: client.interactions requires >=2.x — the Interactions API surface
+# isn't present in the 1.x line.
+google-genai==2.25.0
+pydantic==2.9.2
+
+# Google Drive ingestion
+gdown==6.4.0
+
+# Media probing (ffmpeg/ffprobe must be installed separately, e.g. `brew install ffmpeg`)
