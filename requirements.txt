@@ -8,6 +8,18 @@ google-genai==2.25.0
 pydantic==2.9.2
 
 # Google Drive ingestion
+# Preferred path: service account auth via google-api-python-client's
+# official MediaIoBaseDownload (chunked, retry-capable). A bare API key
+# is treated as anonymous traffic by Google's front-door anti-abuse
+# system and is more prone to a "computer or network may be sending
+# automated queries" 403 on binary downloads — confirmed against multiple
+# independent reports; service-account/OAuth-authenticated requests don't
+# hit this. See drive_ingest.py module docstring.
+google-api-python-client==2.200.0
+google-auth==2.58.1
+# requests: kept for the API-key path (fallback only, see docstring).
+requests==2.34.2
+# gdown: last-resort fallback if neither a service account nor API key is set.
 gdown==6.4.0
 
 # Media probing (ffmpeg/ffprobe must be installed separately, e.g. `brew install ffmpeg`)

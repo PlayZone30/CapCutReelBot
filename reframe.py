@@ -14,6 +14,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import config
 from probe import ClipInfo, probe_clip
 
 TARGET_WIDTH = 1080
@@ -78,7 +79,7 @@ def reframe_clip(src_path: str | Path, dest_path: str | Path, info: ClipInfo | N
         "-noautorotate",
         "-i", str(src_path),
         "-vf", filter_chain,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        *config.video_codec_args(),
         "-c:a", "copy",
         str(dest_path),
     ]

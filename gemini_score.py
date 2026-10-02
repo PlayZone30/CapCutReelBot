@@ -124,24 +124,66 @@ def _get_rate_limiter() -> RateLimiter:
     )
 
 
+def _format_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def _delete_file(client: genai.Client, file_name: str, path_name: str) -> None:
+    """Best-effort deletion of an uploaded file from Gemini Files API."""
+    try:
+        client.files.delete(name=file_name)
+        print(f"  [{path_name}] deleted from Gemini Files API ({file_name})", flush=True)
+    except Exception as e:
+        print(f"  [{path_name}] note: failed to delete from Gemini Files API ({file_name}): {e}", flush=True)
+
+
 def _upload_and_wait(client: genai.Client, path: Path):
     """
     Upload a file and poll until it's ACTIVE. This does NOT count against
     the inference quota, so callers may run this concurrently across
     many clips without a rate limiter.
+
+    The google-genai SDK's files.upload() is a single blocking call with
+    no progress callback — for a multi-hundred-MB merged batch over a slow
+    connection, that call can legitimately take many minutes with zero
+    output, which is indistinguishable from a hang. Print explicit
+    before/after markers with file size and elapsed time so a long upload
+    is visibly "in progress," not silent.
     """
+    size_bytes = path.stat().st_size
+    print(f"  [{path.name}] uploading ({_format_bytes(size_bytes)})...", flush=True)
+    upload_start = time.monotonic()
+
     myfile = client.files.upload(file=str(path))
-    while not myfile.state or myfile.state.name != "ACTIVE":
-        if myfile.state and myfile.state.name == "FAILED":
-            raise GeminiScoreError(f"Gemini file processing failed for {path}")
-        time.sleep(2)
-        myfile = client.files.get(name=myfile.name)
+
+    upload_elapsed = time.monotonic() - upload_start
+    print(f"  [{path.name}] upload finished in {upload_elapsed:.1f}s, "
+          f"waiting for Gemini to process it (state={myfile.state.name if myfile.state else 'unknown'})...",
+          flush=True)
+
+    poll_start = time.monotonic()
+    try:
+        while not myfile.state or myfile.state.name != "ACTIVE":
+            if myfile.state and myfile.state.name == "FAILED":
+                raise GeminiScoreError(f"Gemini file processing failed for {path}")
+            time.sleep(2)
+            myfile = client.files.get(name=myfile.name)
+    except Exception:
+        _delete_file(client, myfile.name, path.name)
+        raise
+
+    print(f"  [{path.name}] ready (processing took {time.monotonic() - poll_start:.1f}s)", flush=True)
     return myfile
 
 
 def score_clip(clip_path: str | Path, rubric: str = DEFAULT_RUBRIC,
                client: genai.Client | None = None,
-               rate_limiter: RateLimiter | None | bool = True) -> ClipAnalysis:
+               rate_limiter: RateLimiter | None | bool = True,
+               max_retries: int = 3) -> ClipAnalysis:
     """
     Upload a single clip to Gemini and get back a structured ClipAnalysis:
     the full clip segmented into sequential shots, each independently
@@ -161,40 +203,97 @@ def score_clip(clip_path: str | Path, rubric: str = DEFAULT_RUBRIC,
     Pass an existing RateLimiter instance to share state across a batch
     (score_many does this), or pass False to skip throttling entirely
     (not recommended — nothing stops you from blowing through the quota).
+
+    `max_retries` specifies the number of retry attempts. On failure, the
+    uploaded file is deleted from Gemini Files API, and the entire cycle
+    (upload -> score -> cleanup) is retried from scratch with a fresh upload.
     """
     clip_path = Path(clip_path)
     client = client or _get_client()
 
-    myfile = _upload_and_wait(client, clip_path)
-
     if rate_limiter is True:
         rate_limiter = _get_rate_limiter()
-    if rate_limiter:
-        rate_limiter.acquire()
 
-    interaction = client.interactions.create(
-        model=config.GEMINI_MODEL,
-        input=[
-            {"type": "video", "uri": myfile.uri, "mime_type": myfile.mime_type},
-            {"type": "text", "text": rubric},
-        ],
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": ClipAnalysis.model_json_schema(),
-        },
-    )
+    total_attempts = 1 + max_retries
+    last_error: Exception | None = None
 
-    try:
-        return ClipAnalysis.model_validate_json(interaction.output_text)
-    except Exception as e:
-        raise GeminiScoreError(
-            f"Failed to parse Gemini response for {clip_path}: {e}\nRaw: {interaction.output_text}"
-        ) from e
+    for attempt in range(1, total_attempts + 1):
+        attempt_str = f" (attempt {attempt}/{total_attempts})" if total_attempts > 1 else ""
+        myfile = None
+
+        try:
+            print(f"  [{clip_path.name}] starting full processing{attempt_str}...", flush=True)
+            myfile = _upload_and_wait(client, clip_path)
+
+            if rate_limiter:
+                rate_limiter.acquire()
+
+            print(f"  [{clip_path.name}] scoring with Gemini{attempt_str}...", flush=True)
+            score_start = time.monotonic()
+
+            interaction = client.interactions.create(
+                model=config.GEMINI_MODEL,
+                input=[
+                    # media_resolution "low": Gemini samples video at a fixed 1
+                    # frame/second regardless of source quality, and per Google's
+                    # docs "low" and "medium" cost the identical 70 tokens/frame
+                    # for video (only "high" differs, at 280 tokens/frame, meant
+                    # for OCR/dense-text use cases we don't need here). Pinning
+                    # "low" explicitly removes ambiguity about what the
+                    # unspecified default resolves to, at zero quality cost for
+                    # this task (shot/camera-movement classification, not text
+                    # reading) and no change to source file size/bitrate needed.
+                    {"type": "video", "uri": myfile.uri, "mime_type": myfile.mime_type,
+                     "resolution": "low"},
+                    {"type": "text", "text": rubric},
+                ],
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": ClipAnalysis.model_json_schema(),
+                },
+            )
+
+            print(f"  [{clip_path.name}] scoring done in {time.monotonic() - score_start:.1f}s", flush=True)
+            
+            # Print the raw AI output to the console
+            print(f"  [{clip_path.name}] AI Raw Output:\n{interaction.output_text}\n", flush=True)
+
+            try:
+                return ClipAnalysis.model_validate_json(interaction.output_text)
+            except Exception as e:
+                raise GeminiScoreError(
+                    f"Failed to parse Gemini response for {clip_path}: {e}\nRaw: {interaction.output_text}"
+                ) from e
+
+        except RateLimitExceeded:
+            # Daily quota exceeded; no point waiting or retrying inside this run
+            raise
+        except Exception as e:
+            last_error = e
+            err_msg = str(e).lower()
+            if "per day" in err_msg or "daily" in err_msg:
+                print(f"  [{clip_path.name}] Gemini daily quota reached: {e}", flush=True)
+                raise RateLimitExceeded(str(e)) from e
+
+            if attempt < total_attempts:
+                delay = 5 * (2 ** (attempt - 1))
+                print(f"  [{clip_path.name}] attempt {attempt} failed ({e}). Deleted file, re-uploading and retrying in {delay}s...", flush=True)
+                time.sleep(delay)
+            else:
+                print(f"  [{clip_path.name}] all {total_attempts} attempts failed.", flush=True)
+        finally:
+            if myfile is not None:
+                _delete_file(client, myfile.name, clip_path.name)
+
+    if last_error:
+        raise last_error
+    raise GeminiScoreError(f"Scoring failed for {clip_path}")
 
 
 def score_many(clip_paths: list[str | Path], rubric: str = DEFAULT_RUBRIC,
-               max_workers: int | None = None) -> dict[str, ClipAnalysis | Exception]:
+               max_workers: int | None = None,
+               on_result=None) -> dict[str, ClipAnalysis | Exception]:
     """
     Score multiple clips concurrently. Uploads happen in parallel across
     up to `max_workers` threads; the actual scoring calls are serialized
@@ -204,6 +303,14 @@ def score_many(clip_paths: list[str | Path], rubric: str = DEFAULT_RUBRIC,
     Each genai.Client is not guaranteed thread-safe for concurrent calls
     from the SDK's perspective, so each worker thread gets its own client
     (cheap — it's just an HTTP client wrapper, no separate auth round trip).
+
+    `on_result`, if given, is called as `on_result(path, result)` the
+    MOMENT each clip finishes — via as_completed(), not in submission
+    order. Without this, a caller has no way to see a clip's results
+    until every clip in the batch has finished: this function otherwise
+    only returns once ALL clips are done, so with a handful of large
+    clips (a merged ~3min batch can be 200MB+) a caller could wait many
+    minutes with the first clip's results sitting ready but invisible.
 
     Returns a dict keyed by str(path). Failed clips map to the raised
     exception instead of a ClipAnalysis, so one bad clip doesn't abort the
@@ -223,20 +330,24 @@ def score_many(clip_paths: list[str | Path], rubric: str = DEFAULT_RUBRIC,
         for future in as_completed(future_to_path):
             path = future_to_path[future]
             try:
-                results[str(path)] = future.result()
-            except (GeminiScoreError, RateLimitExceeded) as e:
-                results[str(path)] = e
+                result = future.result()
+            except Exception as e:
+                result = e
+            results[str(path)] = result
+            if on_result is not None:
+                on_result(path, result)
 
     return results
 
 
 def score_folder(folder: str | Path, rubric: str = DEFAULT_RUBRIC,
                   extensions: tuple[str, ...] = (".mp4", ".mov", ".m4v"),
-                  max_workers: int | None = None) -> dict[str, ClipAnalysis | Exception]:
+                  max_workers: int | None = None,
+                  on_result=None) -> dict[str, ClipAnalysis | Exception]:
     """Score every video file in a folder (non-recursive), in parallel."""
     folder = Path(folder)
     files = [f for f in sorted(folder.iterdir()) if f.suffix.lower() in extensions]
-    return score_many(files, rubric, max_workers=max_workers)
+    return score_many(files, rubric, max_workers=max_workers, on_result=on_result)
 
 
 if __name__ == "__main__":

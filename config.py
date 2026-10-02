@@ -39,6 +39,10 @@ GEMINI_RATE_STATE_FILE = REPO_ROOT / ".gemini_rate_state.json"
 
 # How many clips to upload/score concurrently. Uploads run fully parallel;
 # the rate limiter below throttles only the inference calls to GEMINI_RPM.
+# This is intentionally independent of FFMPEG_MAX_WORKERS — uploading a
+# merged batch to Gemini is bandwidth-bound, not CPU-bound, so the
+# reasoning that caps ffmpeg concurrency (CPU/RAM headroom for other apps)
+# doesn't apply here at all. Don't default this off of FFMPEG_MAX_WORKERS.
 GEMINI_MAX_WORKERS = int(_getenv("GEMINI_MAX_WORKERS", "5"))
 
 # ---------------------------------------------------------------------------
@@ -46,6 +50,81 @@ GEMINI_MAX_WORKERS = int(_getenv("GEMINI_MAX_WORKERS", "5"))
 # ---------------------------------------------------------------------------
 DRIVE_FOLDER_ID = _getenv("DRIVE_FOLDER_ID")
 GOOGLE_SERVICE_ACCOUNT_FILE = _getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+
+# Plain API key (Drive API enabled, no OAuth/service account needed) for
+# reading public/link-shared folders via the real Drive REST API instead
+# of scraping the anonymous drive.google.com/uc download page (gdown's
+# approach, which is subject to an undocumented "too many viewers"
+# per-file throttle separate from — and much stricter than — the official
+# Drive API quotas). Falls back to gdown automatically if unset.
+# https://console.cloud.google.com/apis/credentials -> Create API key,
+# then enable the "Google Drive API" for the project.
+GOOGLE_API_KEY = _getenv("GOOGLE_API_KEY")
+
+# The google-genai SDK's env-var auto-detection (used only as a fallback
+# when genai.Client() isn't given an explicit api_key — which every call
+# site in this project does provide, via require_gemini_key() below) reads
+# GOOGLE_API_KEY straight out of os.environ and logs a "Both GOOGLE_API_KEY
+# and GEMINI_API_KEY are set" warning whenever both exist there, regardless
+# of which one actually ends up used. Since GOOGLE_API_KEY here is for
+# Drive downloads only and has nothing to do with Gemini, unset it from the
+# process environment once we've captured its value above — every other
+# module in this project reads config.GOOGLE_API_KEY (the Python variable),
+# not os.environ directly, so this has no effect on Drive ingestion.
+os.environ.pop("GOOGLE_API_KEY", None)
+
+# How many files to download concurrently when using the Drive API path.
+# Each download costs 200 quota units; per-minute-per-user cap is 325,000,
+# so even a generous worker count here is far from that ceiling for any
+# realistic folder size.
+DRIVE_MAX_WORKERS = int(_getenv("DRIVE_MAX_WORKERS", "6"))
+
+# Which video encoder every ffmpeg-calling module uses (probe.py's
+# normalize_rotation, reframe.py, merge_clips.py, trim.py, speed_process.py).
+#   "videotoolbox" -> Apple hardware H.264 encoder (macOS only). Measured on
+#       the M1 this project was developed on: ~1.6x faster per job and
+#       under half the CPU (210% vs 502%) than libx264 below, BUT multiple
+#       concurrent hardware sessions do NOT parallelize on this chip
+#       (2 concurrent sessions measured at ~2x one session's time, i.e.
+#       they serialize) — so FFMPEG_MAX_WORKERS defaults to 1 for this
+#       encoder, see below. Real quality trade-off: uses -q:v (0-100, not
+#       a direct equivalent of -crf) and is widely reported lower quality
+#       per bitrate than libx264 at comparable settings.
+#   "libx264"     -> software encoder. Genuinely parallelizes across
+#       multiple concurrent ffmpeg processes (each using its own CPU
+#       cores), and gives predictable, tunable quality via -crf.
+# Measured end-to-end on this project's real 45-clip / ~1000s-footage
+# shoot: videotoolbox (1 worker) finished the rotation-normalize stage in
+# ~302s vs libx264 (2 workers) at ~383s — videotoolbox won by ~21% despite
+# no concurrency, because its per-job speed advantage was larger than what
+# 2-way software parallelism bought back. That result is specific to an
+# 8-core/8GB M1 and to this project's clip-length mix; re-measure before
+# assuming it holds on different hardware or very different footage.
+VIDEO_ENCODER = _getenv("VIDEO_ENCODER", "videotoolbox")
+
+# How many concurrent ffmpeg processes to run for the rotation-normalize
+# and merge pipeline stages. Defaults depend on VIDEO_ENCODER: 1 for
+# videotoolbox (concurrency doesn't help it, see above), 2 for libx264
+# (software encoding genuinely parallelizes, but each process is itself
+# multi-threaded, and the user may be running other applications at the
+# same time, so this stays conservative rather than scaling to core
+# count). Override explicitly in .env if you know you have more headroom.
+_FFMPEG_MAX_WORKERS_DEFAULT = "1" if VIDEO_ENCODER == "videotoolbox" else "2"
+FFMPEG_MAX_WORKERS = int(_getenv("FFMPEG_MAX_WORKERS", _FFMPEG_MAX_WORKERS_DEFAULT))
+
+
+def video_codec_args(quality: str = "high") -> list[str]:
+    """
+    Return the -c:v ... ffmpeg args for the configured VIDEO_ENCODER.
+    `quality` is a rough knob ("high"/"medium") mapped to encoder-specific
+    settings, since -crf (libx264) and -q:v (videotoolbox) aren't on
+    directly comparable scales.
+    """
+    if VIDEO_ENCODER == "videotoolbox":
+        q = "65" if quality == "high" else "50"
+        return ["-c:v", "h264_videotoolbox", "-q:v", q]
+    crf = "18" if quality == "high" else "23"
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf]
 
 # ---------------------------------------------------------------------------
 # CapCut draft locations (OS-dependent)

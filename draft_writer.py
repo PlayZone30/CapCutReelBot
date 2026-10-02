@@ -36,12 +36,14 @@ import copy
 import json
 import os
 import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 import config
+from probe import probe_clip
 
 # The 6 "empty" material buckets every segment drags along via
 # extra_material_refs, and the boilerplate fields each entry needs.
@@ -197,12 +199,91 @@ def new_uuid() -> str:
     return str(uuid.uuid4()).upper()
 
 
-def clone_draft(draft_name: str, dest_root: Path | str | None = None,
-                 template_dir: Path | str | None = None) -> Path:
+def _reset_ancillary_files(dest_folder: Path, timeline_id: str, draft_id: str, draft_name: str) -> None:
     """
-    Clone templates/reference_draft/ into <dest_root>/<draft_name>, strip the
-    two sample segments/materials from the cloned draft_info.json so it
-    starts as an empty timeline, and return the new draft folder path.
+    Fix every OTHER file in the cloned draft folder that carries stale
+    cross-references from templates/reference_draft/ (the original "0926"
+    capture) forward into every draft we generate. clone_draft() only used
+    to touch draft_info.json — everything below was silently copied
+    verbatim and left pointing at ids/paths/materials that don't exist in
+    the new draft. Confirmed by grepping every UUID in the template folder
+    against every other file in it:
+
+    - timeline_layout.json: its dockItems reference the OLD draft_info.json
+      "id" (the template's timeline id). draft_info.json's id is
+      regenerated per clone, but this file never was updated to match —
+      so every cloned draft's timeline-layout metadata pointed at a
+      timeline id that no longer exists in that draft.
+    - draft_meta_info.json: draft_id was the ORIGINAL "0926" draft's
+      registration id, identical (and stale) across every single clone.
+      draft_fold_path/draft_name still said ".../0926". draft_materials
+      listed the template's two sample clips (3rules.mp4/example.mp4),
+      which don't exist in any generated draft. Also: register_draft()
+      separately invented its own random draft_id for root_meta_info.json,
+      so the id CapCut has registered for a draft never matched the id
+      inside that draft's own draft_meta_info.json — now fixed by having
+      both use the SAME draft_id, generated once here.
+    - draft_virtual_store.json: its root-folder listing (type 1) named the
+      two template videos' material ids — stale, since no draft we
+      generate contains those materials.
+    - key_value.json: cached segment/material metadata keyed by the
+      template's old segment/material ids — same staleness.
+    """
+    now_us = int(time.time() * 1_000_000)
+
+    timeline_path = dest_folder / "timeline_layout.json"
+    with open(timeline_path, encoding="utf-8") as f:
+        layout = json.load(f)
+    for item in layout.get("dockItems", []):
+        item["timelineIds"] = [timeline_id]
+        item["timelineNames"] = [timeline_id]
+    with open(timeline_path, "w", encoding="utf-8") as f:
+        json.dump(layout, f)
+
+    meta_path = dest_folder / "draft_meta_info.json"
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    meta["draft_id"] = draft_id
+    meta["draft_name"] = draft_name
+    meta["draft_fold_path"] = str(dest_folder)
+    meta["draft_root_path"] = str(dest_folder.parent)
+    meta["draft_cover"] = "draft_cover.jpg"
+    meta["tm_draft_create"] = now_us
+    meta["tm_draft_modified"] = now_us
+    meta["tm_duration"] = 0
+    # draft_materials is a list of {"type": N, "value": [...]} buckets —
+    # keep the bucket shape (CapCut expects all type slots present) but
+    # empty every value list, since the template's cached entries
+    # (3rules.mp4/example.mp4) don't exist in this draft.
+    for bucket in meta.get("draft_materials", []):
+        bucket["value"] = []
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+    vstore_path = dest_folder / "draft_virtual_store.json"
+    with open(vstore_path, encoding="utf-8") as f:
+        vstore = json.load(f)
+    for bucket in vstore.get("draft_virtual_store", []):
+        if bucket.get("type") == 1:
+            bucket["value"] = []
+    with open(vstore_path, "w", encoding="utf-8") as f:
+        json.dump(vstore, f)
+
+    kv_path = dest_folder / "key_value.json"
+    with open(kv_path, "w", encoding="utf-8") as f:
+        json.dump({}, f)
+
+
+def clone_draft(draft_name: str, dest_root: Path | str | None = None,
+                 template_dir: Path | str | None = None) -> tuple[Path, str]:
+    """
+    Clone templates/reference_draft/ into <dest_root>/<draft_name>, strip
+    the two sample segments/materials from the cloned draft_info.json so
+    it starts as an empty timeline, fix every other file's stale
+    cross-references to the template (see _reset_ancillary_files), and
+    return (dest_folder, draft_id) — draft_id is generated once here so
+    register_draft() can reuse the exact same id CapCut sees in
+    draft_meta_info.json, instead of each inventing its own.
     """
     template_dir = Path(template_dir or config.TEMPLATE_DRAFT_DIR)
     dest_root = Path(dest_root or config.CAPCUT_DRAFT_ROOT)
@@ -218,8 +299,11 @@ def clone_draft(draft_name: str, dest_root: Path | str | None = None,
         draft = json.load(f)
 
     # Reset to an empty timeline: wipe segments + all per-clip materials,
-    # keep the top-level boilerplate (canvas_config, config, platform, etc).
-    draft["id"] = new_uuid()
+    # keep the top-level boilerplate (canvas_config gets set later in
+    # build_draft() once we know the actual footage's orientation; config,
+    # platform, etc. are left as-is).
+    timeline_id = new_uuid()
+    draft["id"] = timeline_id
     draft["duration"] = 0
     for track in draft.get("tracks", []):
         track["segments"] = []
@@ -229,7 +313,10 @@ def clone_draft(draft_name: str, dest_root: Path | str | None = None,
     with open(draft_path, "w", encoding="utf-8") as f:
         json.dump(draft, f)
 
-    return dest_folder
+    draft_id = new_uuid()
+    _reset_ancillary_files(dest_folder, timeline_id=timeline_id, draft_id=draft_id, draft_name=draft_name)
+
+    return dest_folder, draft_id
 
 
 def _add_empty(draft: dict, bucket: str, **overrides: Any) -> str:
@@ -304,11 +391,19 @@ def load_draft(draft_folder: Path | str) -> dict:
 
 
 def register_draft(root_meta_path: Path | str, folder_path: Path | str,
-                    draft_json_path: Path | str, draft_name: str, duration_us: int) -> None:
+                    draft_json_path: Path | str, draft_name: str, duration_us: int,
+                    draft_id: str | None = None) -> None:
     """
     Append one entry to root_meta_info.json's all_draft_store, and bump
     draft_ids. Without this the draft folder is valid but won't show up in
     CapCut's project list.
+
+    `draft_id` should be the SAME id already written into this draft's
+    own draft_meta_info.json (clone_draft() generates and returns one) —
+    previously this function always invented its own random id here,
+    which meant the id CapCut registered for a draft never matched the id
+    inside that draft's own metadata. Falls back to a fresh id if not
+    given (e.g. for standalone/manual use of this function).
     """
     root_meta_path = Path(root_meta_path)
     with open(root_meta_path, encoding="utf-8") as f:
@@ -322,7 +417,7 @@ def register_draft(root_meta_path: Path | str, folder_path: Path | str,
         "draft_cloud_videocut_purchase_info": "",
         "draft_cover": str(Path(folder_path) / "draft_cover.jpg"),
         "draft_fold_path": str(folder_path),
-        "draft_id": new_uuid(),
+        "draft_id": draft_id or new_uuid(),
         "draft_is_ai_shorts": False, "draft_is_cloud_temp_draft": False,
         "draft_is_infinite_canvas_draft": False, "draft_is_invisible": False,
         "draft_is_pippit_draft": False, "draft_is_web_article_video": False,
@@ -362,21 +457,107 @@ def _copy_into_draft_materials(clip_path: str | Path, dest_folder: Path | str) -
     return dest_path
 
 
+def _set_canvas_for_footage(draft: dict, clips: list[dict[str, Any]]) -> None:
+    """
+    Set canvas_config to match the actual footage instead of inheriting
+    the template's hardcoded 1920x1080 landscape canvas (copied verbatim
+    from the original "0926" capture, which happened to be a landscape
+    project). Without this, portrait footage gets pillarboxed with black
+    bars against a landscape canvas in CapCut — confirmed visually against
+    a real exported draft.
+
+    If clips are mixed orientation, the majority orientation (by total
+    duration, not clip count) wins the canvas — the minority clips will
+    still show bars against it, since CapCut's canvas is one setting per
+    draft, not per-segment. There's no way to give every clip a
+    bars-free canvas within a single draft when orientations are mixed;
+    that's a property of how CapCut's timeline works, not something this
+    function can route around.
+    """
+    if not clips:
+        return
+
+    portrait_duration = sum(c["duration_us"] for c in clips if c["height"] >= c["width"])
+    landscape_duration = sum(c["duration_us"] for c in clips if c["height"] < c["width"])
+
+    if portrait_duration >= landscape_duration:
+        widest = max((c for c in clips if c["height"] >= c["width"]), key=lambda c: c["width"], default=clips[0])
+    else:
+        widest = max((c for c in clips if c["height"] < c["width"]), key=lambda c: c["width"], default=clips[0])
+
+    draft["canvas_config"] = {
+        "background": None,
+        "height": widest["height"],
+        "ratio": "original",
+        "width": widest["width"],
+    }
+
+
+def _generate_draft_cover(dest_folder: Path, first_clip_path: Path) -> None:
+    """
+    Overwrite <dest_folder>/draft_cover.jpg with a real frame grabbed from
+    the first surviving clip, instead of leaving the template's stock
+    thumbnail in place (clone_draft() copies the whole template folder
+    verbatim, including draft_cover.jpg — nothing had ever actually
+    regenerated it until now, so every draft this pipeline built showed
+    whatever image happened to be captured in the original reference
+    draft, unrelated to the real footage).
+
+    Grabs the frame at 0.5s rather than 0.0s to skip a possible black
+    first frame / encoder warm-up frame. Falls back to 0.0s if the clip is
+    shorter than that. If ffmpeg fails for any reason, logs a warning and
+    leaves the existing draft_cover.jpg in place rather than raising —
+    a wrong-but-present cover is cosmetic, not worth failing the whole
+    draft build over.
+    """
+    cover_path = dest_folder / "draft_cover.jpg"
+    try:
+        info = probe_clip(first_clip_path)
+    except Exception as e:
+        print(f"  warning: could not probe {first_clip_path} for a cover frame: {e}")
+        return
+
+    seek_seconds = 0.5 if info.duration_s > 0.5 else 0.0
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(seek_seconds),
+        "-i", str(first_clip_path),
+        "-frames:v", "1",
+        "-q:v", "2",
+        str(cover_path),
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        detail = e.stderr.strip() if isinstance(e, subprocess.CalledProcessError) else str(e)
+        print(f"  warning: failed to generate draft_cover.jpg from {first_clip_path}: {detail}")
+
+
 def build_draft(draft_name: str, clips: list[dict[str, Any]],
                  root_meta_path: Path | str, dest_root: Path | str | None = None) -> Path:
     """
     End-to-end helper: clone the template, copy every clip into the draft's
     own materials/ folder (so CapCut's sandbox can read them), append them
-    to the timeline, save, and register the draft so it shows up in CapCut.
+    to the timeline, set the canvas to match the actual footage, generate
+    a real thumbnail from the footage, save, and register the draft so it
+    shows up in CapCut.
 
     `clips` is a list of dicts with keys: path, duration_us, width, height.
     """
-    dest_folder = clone_draft(draft_name, dest_root=dest_root)
+    dest_folder, draft_id = clone_draft(draft_name, dest_root=dest_root)
     draft = load_draft(dest_folder)
 
     for clip in clips:
         in_draft_path = _copy_into_draft_materials(clip["path"], dest_folder)
         add_clip_to_draft(draft, in_draft_path, clip["duration_us"], clip["width"], clip["height"])
+
+    _set_canvas_for_footage(draft, clips)
+
+    if clips:
+        # Use the in-draft copy (materials/<name>), not the original repo
+        # path, so this still works if the original gets cleaned up later.
+        first_in_draft_path = dest_folder / "materials" / Path(clips[0]["path"]).name
+        _generate_draft_cover(dest_folder, first_in_draft_path)
 
     save_draft(draft, dest_folder)
     register_draft(
@@ -385,6 +566,7 @@ def build_draft(draft_name: str, clips: list[dict[str, Any]],
         draft_json_path=dest_folder / config.DRAFT_FILENAME,
         draft_name=draft_name,
         duration_us=draft["duration"],
+        draft_id=draft_id,
     )
     return dest_folder
 

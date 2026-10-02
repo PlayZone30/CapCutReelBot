@@ -21,6 +21,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import config
+
 
 class TrimError(RuntimeError):
     pass
@@ -48,7 +50,7 @@ def trim_clip(src_path: str | Path, dest_path: str | Path,
         "-i", str(src_path),
         "-ss", str(start_seconds),
         "-to", str(end_seconds),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        *config.video_codec_args(),
         "-c:a", "aac",
         "-avoid_negative_ts", "make_zero",
         str(dest_path),

@@ -2,6 +2,9 @@
 .env
 *.json.key
 service_account*.json
+credentials.json
+credentials*.json
+vertexAI.json
 
 # Rate limiter state
 .gemini_rate_state.json

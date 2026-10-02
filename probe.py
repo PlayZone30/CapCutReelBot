@@ -17,6 +17,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import config
+
 
 class ProbeError(RuntimeError):
     pass
@@ -197,7 +199,7 @@ def normalize_rotation(src_path: str | Path, dest_path: str | Path,
         "-noautorotate",
         "-i", str(src_path),
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        *config.video_codec_args(),
         "-c:a", "copy",
         str(dest_path),
     ]

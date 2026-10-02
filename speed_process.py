@@ -27,6 +27,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import config
 from probe import ClipInfo, probe_clip
 
 RIFE_FPS_THRESHOLD = 24.0
@@ -60,7 +61,7 @@ def _run_setpts(src: Path, dest: Path, speed_factor: float, has_audio: bool) -> 
     else:
         cmd += ["-an"]
 
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", str(dest)]
+    cmd += [*config.video_codec_args(), str(dest)]
 
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -123,7 +124,7 @@ def _run_rife(src: Path, dest: Path, speed_factor: float, info: ClipInfo) -> Non
         ]
         if info.has_audio:
             cmd += ["-i", str(src), "-map", "0:v", "-map", "1:a", "-af", _atempo_chain(speed_factor)]
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", str(dest)]
+        cmd += [*config.video_codec_args(), str(dest)]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as e:
         raise SpeedProcessError(f"RIFE pipeline failed on {src}: {e.stderr.strip()}") from e

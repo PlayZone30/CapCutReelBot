@@ -5,10 +5,15 @@ main.py — orchestrates the full pipeline end to end:
       -> drive_ingest.py   pulls raw clips to /raw
       -> probe.py          fps/duration/resolution/rotation per clip
       -> probe.py          normalize rotation (bake in any rotation tag)
-      -> gemini_score.py   Gemini segments each clip into shots, scores each
-                            shot at native speed/duration (see gemini_score.py
-                            docstring for why scoring happens before any trim
-                            or speed change)
+      -> merge_clips.py     bin-pack normalized clips into ~3-minute merged
+                            batches before they ever go to Gemini (see
+                            merge_clips.py docstring — this is what keeps a
+                            46-clip Drive folder from costing 46 Gemini
+                            requests against a 20/day free-tier quota)
+      -> gemini_score.py   Gemini segments each MERGED batch into shots,
+                            scored at native speed/duration (see
+                            gemini_score.py docstring for why scoring
+                            happens before any trim or speed change)
       -> trim.py            cut each surviving shot down to its own
                             [start_seconds, end_seconds) range
       -> speed_process.py   bake in a speed change on the TRIMMED shot only
@@ -38,17 +43,23 @@ Usage:
     python main.py --skip-score              # skip Gemini scoring, use full clips as-is
     python main.py --min-score 6.0           # drop shots scoring below this threshold
     python main.py --speed-factor 0.5        # bake this speed into every surviving shot
+    python main.py --merge-target-seconds 170  # override the ~3min merge-batch size
+    python main.py --skip-merge              # score each clip separately (old behavior)
+    python main.py --resume-from-merged      # skip ingest/probe/normalize/merge entirely;
+                                              # start straight from processed/merged*.mp4
 """
 from __future__ import annotations
 
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import config
 import draft_writer
 import drive_ingest
 import gemini_score
+import merge_clips
 import reframe
 import speed_process
 from probe import ClipInfo, normalize_rotation, probe_clip
@@ -56,7 +67,32 @@ from trim import trim_clip
 
 
 def run_pipeline(draft_name: str, skip_ingest: bool = False, skip_score: bool = False,
-                  min_score: float = 0.0, speed_factor: float = 1.0) -> Path:
+                  min_score: float = 0.0, speed_factor: float = 1.0,
+                  skip_merge: bool = False,
+                  merge_target_seconds: float = merge_clips.DEFAULT_TARGET_SECONDS,
+                  resume_from_merged: bool = False) -> Path:
+    # 0. Resume from already-merged batches: skip ingest, probe,
+    #    rotation-normalize, and merge entirely, and pick up straight from
+    #    whatever processed/merged*.mp4 files already exist on disk. Useful
+    #    when a previous run got through merging (the slow, CPU-heavy part)
+    #    but stopped before or during Gemini scoring — there's no need to
+    #    re-download or re-encode anything to try again.
+    if resume_from_merged:
+        merged_clips = sorted(config.PROCESSED_DIR.glob("merged*.mp4"))
+        if not merged_clips:
+            print(f"No merged*.mp4 files found in {config.PROCESSED_DIR}; "
+                  "can't use --resume-from-merged. Run without it first.", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"Resuming from {len(merged_clips)} existing merged batch(es) in {config.PROCESSED_DIR}:")
+        infos: dict[Path, ClipInfo] = {}
+        for clip in merged_clips:
+            infos[clip] = probe_clip(clip)
+            print(f"  {clip.name}: {infos[clip].duration_s:.1f}s")
+        raw_clips = merged_clips
+        return _score_trim_and_write(
+            raw_clips, infos, draft_name, skip_score, min_score, speed_factor,
+        )
+
     # 1. Ingest
     if skip_ingest:
         raw_clips = sorted(
@@ -87,28 +123,103 @@ def run_pipeline(draft_name: str, skip_ingest: bool = False, skip_score: bool = 
     #    correctly-oriented pixels"). This runs on the whole clip, before
     #    trimming, since it's cheap relative to RIFE and every shot
     #    extracted from this clip needs to inherit the fix.
-    print("\nNormalizing rotation (only clips with a rotation tag)...")
-    normalized_clips: list[Path] = []
-    for clip in raw_clips:
+    #
+    #    Each clip's rotation fix is fully independent of every other
+    #    clip's, so this runs concurrently (FFMPEG_MAX_WORKERS, default 2 —
+    #    kept low since each ffmpeg process is itself multi-threaded and
+    #    the machine may be running other applications at the same time).
+    print(f"\nNormalizing rotation (only clips with a rotation tag, "
+          f"up to {config.FFMPEG_MAX_WORKERS} concurrent)...")
+
+    def _normalize_one(clip: Path) -> tuple[Path, Path | None]:
         info = infos[clip]
-        if info.rotation != 0:
-            dest = config.PROCESSED_DIR / f"rot_norm_{clip.name}"
-            out = normalize_rotation(clip, dest, info)
-            print(f"  {clip.name}: rotation={info.rotation} -> normalized to {out.name}")
+        if info.rotation == 0:
+            return clip, None
+        dest = config.PROCESSED_DIR / f"rot_norm_{clip.name}"
+        out = normalize_rotation(clip, dest, info)
+        return clip, out
+
+    normalized_clips: list[Path] = []
+    with ThreadPoolExecutor(max_workers=config.FFMPEG_MAX_WORKERS) as pool:
+        for clip, out in pool.map(_normalize_one, raw_clips):
+            if out is None:
+                normalized_clips.append(clip)
+                continue
+            print(f"  {clip.name}: rotation={infos[clip].rotation} -> normalized to {out.name}")
             infos[out] = probe_clip(out)
             normalized_clips.append(out)
-        else:
-            normalized_clips.append(clip)
     raw_clips = normalized_clips
 
-    # 4. Gemini scoring (optional) — each clip is segmented into shots and
-    #    scored at native speed/duration (see gemini_score.py). Clips are
-    #    scored concurrently; uploads run fully in parallel and only the
-    #    metered inference call is throttled to GEMINI_RPM/GEMINI_RPD (see
+    # 4. Merge clips into ~3-minute batches before anything gets sent to
+    #    Gemini. See merge_clips.py for the bin-packing rule. This step
+    #    changes what "a clip" means for every step after it: from here
+    #    on, `raw_clips` holds merged batch files (or single clips
+    #    untouched, if a clip was already >= the target on its own, or
+    #    --skip-merge was passed). Shot start/end seconds Gemini returns
+    #    are relative to whichever file it was actually shown, so trimming
+    #    downstream works correctly either way with no extra bookkeeping.
+    if skip_merge:
+        print("\nSkipping merge (--skip-merge); scoring each clip separately.")
+    else:
+        groups = merge_clips.plan_merge_groups(raw_clips, infos, merge_target_seconds)
+        multi_clip_groups = sum(1 for g in groups if len(g) > 1)
+        print(f"\nMerging {len(raw_clips)} clip(s) into {len(groups)} batch(es) "
+              f"(target ~{merge_target_seconds:.0f}s each, {multi_clip_groups} actually merged, "
+              f"up to {config.FFMPEG_MAX_WORKERS} concurrent)...")
+
+        # Each group's merge is independent ffmpeg work, so batches with
+        # 2+ clips run concurrently (same FFMPEG_MAX_WORKERS cap as
+        # rotation-normalize above). Single-clip "groups" need no ffmpeg
+        # call at all — handled inline, not submitted to the pool.
+        def _merge_one(idx_group: tuple[int, list[Path]]) -> tuple[int, Path]:
+            idx, group = idx_group
+            if len(group) == 1:
+                return idx, group[0]
+            dest = config.PROCESSED_DIR / f"merged{idx:03d}.mp4"
+            return idx, merge_clips.merge_clips(group, dest)
+
+        merged_by_idx: dict[int, Path] = {}
+        with ThreadPoolExecutor(max_workers=config.FFMPEG_MAX_WORKERS) as pool:
+            for idx, out in pool.map(_merge_one, enumerate(groups)):
+                merged_by_idx[idx] = out
+
+        merged_clips: list[Path] = []
+        for idx, group in enumerate(groups):
+            out = merged_by_idx[idx]
+            total_s = sum(infos[c].duration_s for c in group)
+            if len(group) == 1:
+                print(f"  batch {idx}: {group[0].name} ({total_s:.1f}s, left as-is)")
+            else:
+                print(f"  batch {idx}: {len(group)} clips ({[c.name for c in group]}) "
+                      f"-> {out.name} ({total_s:.1f}s)")
+                infos[out] = probe_clip(out)
+            merged_clips.append(out)
+        raw_clips = merged_clips
+
+    return _score_trim_and_write(
+        raw_clips, infos, draft_name, skip_score, min_score, speed_factor,
+    )
+
+
+def _score_trim_and_write(raw_clips: list[Path], infos: dict[Path, ClipInfo],
+                           draft_name: str, skip_score: bool, min_score: float,
+                           speed_factor: float) -> Path:
+    """
+    Steps 5-9 of the pipeline: Gemini scoring, trim, speed, reframe, draft
+    write. Split out from run_pipeline() so --resume-from-merged can jump
+    straight here with an existing set of merged batches, instead of
+    re-running ingest/probe/normalize/merge.
+    """
+    # 5. Gemini scoring (optional) — each clip (now possibly a merged
+    #    ~3-minute batch) is segmented into shots and scored at native
+    #    speed/duration (see gemini_score.py). Clips are scored
+    #    concurrently; uploads run fully in parallel and only the metered
+    #    inference call is throttled to GEMINI_RPM/GEMINI_RPD (see
     #    rate_limiter.py).
     #
-    #    kept_shots holds (clip_path, shot) pairs — one raw clip can
-    #    contribute zero, one, or several shots to the final cut.
+    #    kept_shots holds (clip_path, shot) pairs — one clip (merged batch
+    #    or standalone) can contribute zero, one, or several shots to the
+    #    final cut.
     kept_shots: list[tuple[Path, "gemini_score.Shot"]] = []
     if skip_score:
         print("\nSkipping Gemini scoring (--skip-score); using full clips as single shots.")
@@ -128,11 +239,33 @@ def run_pipeline(draft_name: str, skip_ingest: bool = False, skip_score: bool = 
         print(f"\nScoring {len(raw_clips)} clip(s) with Gemini "
               f"(up to {config.GEMINI_MAX_WORKERS} concurrent, "
               f"{config.GEMINI_RPM}/min, {config.GEMINI_RPD}/day)...")
-        results = gemini_score.score_many(raw_clips)
+
+        # on_result fires the moment EACH clip finishes (not after the
+        # whole batch) — without this, score_many() would only return once
+        # every clip is done, so with a handful of large merged batches a
+        # caller could sit with the first clip's results ready but
+        # invisible for many minutes while later clips are still
+        # uploading/scoring. It fires in COMPLETION order, not the
+        # original clip order, so it's used here only for live printing —
+        # kept_shots itself is still built below in raw_clips' original
+        # order, so the final draft's clip order matches the source
+        # footage order regardless of which clip happened to finish first.
+        def _on_result(clip: Path, result) -> None:
+            if isinstance(result, Exception):
+                print(f"  {clip.name}: SCORING FAILED ({result})")
+                return
+            print(f"  {clip.name}: {len(result.shots)} shot(s)")
+            for shot in result.shots:
+                print(f"    [{shot.start_seconds:.1f}s-{shot.end_seconds:.1f}s] {shot.shot_type.value} "
+                      f"score={shot.score:.1f} in_focus={shot.is_in_focus} stability={shot.stability} "
+                      f"— {shot.reasoning}")
+
+        results = gemini_score.score_many(raw_clips, on_result=_on_result)
+
         for clip in raw_clips:
             result = results[str(clip)]
             if isinstance(result, Exception):
-                print(f"  {clip.name}: SCORING FAILED ({result}) — keeping whole clip as one shot.")
+                print(f"  {clip.name}: keeping whole clip as one shot (scoring failed).")
                 info = infos[clip]
                 kept_shots.append((clip, gemini_score.Shot(
                     shot_type=gemini_score.ShotType.OTHER,
@@ -145,13 +278,8 @@ def run_pipeline(draft_name: str, skip_ingest: bool = False, skip_score: bool = 
                 )))
                 continue
 
-            print(f"  {clip.name}: {len(result.shots)} shot(s)")
             for shot in result.shots:
-                print(f"    [{shot.start_seconds:.1f}s-{shot.end_seconds:.1f}s] {shot.shot_type.value} "
-                      f"score={shot.score:.1f} in_focus={shot.is_in_focus} stability={shot.stability} "
-                      f"— {shot.reasoning}")
                 if shot.score < min_score or not shot.is_in_focus:
-                    print("      -> dropped")
                     continue
                 kept_shots.append((clip, shot))
 
@@ -159,7 +287,7 @@ def run_pipeline(draft_name: str, skip_ingest: bool = False, skip_score: bool = 
         print("\nNo shots survived scoring; nothing to write to the draft.", file=sys.stderr)
         raise SystemExit(1)
 
-    # 5. Trim each surviving shot out of its source clip. This is the step
+    # 6. Trim each surviving shot out of its source clip. This is the step
     #    that actually acts on Gemini's start/end range — everything after
     #    this operates on the trimmed shot, not the full raw clip.
     print(f"\nTrimming {len(kept_shots)} shot(s)...")
@@ -170,7 +298,7 @@ def run_pipeline(draft_name: str, skip_ingest: bool = False, skip_score: bool = 
         print(f"  {clip.name} [{shot.start_seconds:.1f}s-{shot.end_seconds:.1f}s] -> {out.name}")
         trimmed_clips.append(out)
 
-    # 6. Speed process — bake speed_factor into each TRIMMED shot only, so
+    # 7. Speed process — bake speed_factor into each TRIMMED shot only, so
     #    RIFE (if the effective fps drops below its threshold) only ever
     #    processes the handful of seconds that made the cut. speed_factor
     #    defaults to 1.0 (passthrough, no-op) until a real per-shot speed
@@ -186,7 +314,7 @@ def run_pipeline(draft_name: str, skip_ingest: bool = False, skip_score: bool = 
         print(f"  {clip.name} -> {out.name}")
         speed_processed_clips.append(out)
 
-    # 7. Reframe (only touches landscape shots)
+    # 8. Reframe (only touches landscape shots)
     print("\nReframing (only shots with a landscape display grid)...")
     processed_clips: list[Path] = []
     for clip in speed_processed_clips:
@@ -199,7 +327,7 @@ def run_pipeline(draft_name: str, skip_ingest: bool = False, skip_score: bool = 
         else:
             processed_clips.append(clip)
 
-    # 8. Write the CapCut draft
+    # 9. Write the CapCut draft
     print(f"\nBuilding draft '{draft_name}'...")
     clip_dicts = []
     for clip in processed_clips:
@@ -233,6 +361,18 @@ def main() -> None:
     parser.add_argument("--speed-factor", type=float, default=1.0,
                          help="Speed factor baked into every surviving shot after trimming "
                               "(1.0 = no change, <1.0 = slow motion, >1.0 = sped up).")
+    parser.add_argument("--skip-merge", action="store_true",
+                         help="Score each clip separately instead of bin-packing into "
+                              "~3-minute batches first (uses more Gemini requests).")
+    parser.add_argument("--merge-target-seconds", type=float,
+                         default=merge_clips.DEFAULT_TARGET_SECONDS,
+                         help=f"Target batch length in seconds when merging clips before "
+                              f"scoring (default: {merge_clips.DEFAULT_TARGET_SECONDS:.0f}).")
+    parser.add_argument("--resume-from-merged", action="store_true",
+                         help="Skip ingest/probe/normalize/merge entirely; start straight "
+                              "from existing processed/merged*.mp4 files. Use this to retry "
+                              "Gemini scoring (or anything after it) without re-downloading "
+                              "or re-encoding a previous run's merged batches.")
     args = parser.parse_args()
 
     run_pipeline(
@@ -241,6 +381,9 @@ def main() -> None:
         skip_score=args.skip_score,
         min_score=args.min_score,
         speed_factor=args.speed_factor,
+        skip_merge=args.skip_merge,
+        merge_target_seconds=args.merge_target_seconds,
+        resume_from_merged=args.resume_from_merged,
     )
 
 
